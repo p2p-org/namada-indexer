@@ -20,19 +20,19 @@ jobs:
     strategy:
       matrix:
         include:
-          - image_name: chain-indexer
+          - image_name: chain
             package: chain
-          - image_name: governance-indexer
+          - image_name: governance
             package: governance
-          - image_name: pos-indexer
+          - image_name: pos
             package: pos
-          - image_name: rewards-indexer
+          - image_name: rewards
             package: rewards
-          - image_name: parameters-indexer
+          - image_name: parameters
             package: parameters
-          - image_name: transaction-indexer
+          - image_name: transaction
             package: transactions
-          - image_name: webserver-indexer
+          - image_name: webserver
             package: webserver
 
     steps:
