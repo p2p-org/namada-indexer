@@ -21,8 +21,8 @@ use crate::config::AppConfig;
 use crate::handler::{
     balance as balance_handlers, chain as chain_handlers,
     crawler_state as crawler_state_handlers, gas as gas_handlers,
-    governance as gov_handlers, pk as pk_handlers, pos as pos_handlers,
-    transaction as transaction_handlers,
+    governance as gov_handlers, pgf as pgf_service, pk as pk_handlers,
+    pos as pos_handlers, transaction as transaction_handlers,
 };
 use crate::state::common::CommonState;
 
@@ -85,6 +85,10 @@ impl ApplicationServer {
                     get(gov_handlers::get_governance_proposal_by_id),
                 )
                 .route(
+                    "/gov/proposal/:id/data",
+                    get(gov_handlers::get_proposal_data_by_proposal_id),
+                )
+                .route(
                     "/gov/proposal/:id/votes",
                     get(gov_handlers::get_governance_proposal_votes),
                 )
@@ -128,6 +132,14 @@ impl ApplicationServer {
                 .route(
                     "/chain/epoch/latest",
                     get(chain_handlers::get_last_processed_epoch),
+                )
+                .route(
+                    "/pgf/payments",
+                    get(pgf_service::get_pgf_continuous_payments),
+                )
+                .route(
+                    "/pgf/paymenents/:proposal_id",
+                    get(pgf_service::get_pgf_payment_by_proposal_id),
                 )
                 .route(
                     "/crawlers/timestamps",

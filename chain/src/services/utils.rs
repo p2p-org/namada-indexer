@@ -1,6 +1,7 @@
 use namada_sdk::borsh::BorshDeserialize;
 use namada_sdk::queries::RPC;
 use namada_sdk::storage::{self, PrefixValue};
+use shared::block::BlockHeight;
 use tendermint_rpc::HttpClient;
 
 /// Query a range of storage values with a matching prefix and decode them with
@@ -9,13 +10,20 @@ use tendermint_rpc::HttpClient;
 pub async fn query_storage_prefix<T>(
     client: &HttpClient,
     key: &storage::Key,
+    height: Option<BlockHeight>,
 ) -> anyhow::Result<Option<impl Iterator<Item = (storage::Key, T)>>>
 where
     T: BorshDeserialize,
 {
     let values = RPC
         .shell()
-        .storage_prefix(client, None, None, false, key)
+        .storage_prefix(
+            client,
+            None,
+            height.map(super::namada::to_block_height),
+            false,
+            key,
+        )
         .await?;
 
     let decode = |PrefixValue { key, value }: PrefixValue| {

@@ -15,8 +15,11 @@ use orm::validators::{
 use shared::block::Epoch;
 use shared::bond::Bonds;
 use shared::id::Id;
+use shared::tuple_len::TupleLen;
 use shared::unbond::{UnbondAddresses, Unbonds};
 use shared::validator::{ValidatorMetadataChange, ValidatorSet};
+
+use super::utils::MAX_PARAM_SIZE;
 
 pub fn clear_bonds(
     transaction_conn: &mut PgConnection,
@@ -54,6 +57,21 @@ pub fn insert_bonds(
     transaction_conn: &mut PgConnection,
     bonds: Bonds,
 ) -> anyhow::Result<()> {
+    let bonds_col_count = bonds::all_columns.len() as i64;
+
+    for chunk in
+        bonds.chunks((MAX_PARAM_SIZE as i64 / bonds_col_count) as usize)
+    {
+        insert_bonds_chunk(transaction_conn, chunk.to_vec())?
+    }
+
+    anyhow::Ok(())
+}
+
+fn insert_bonds_chunk(
+    transaction_conn: &mut PgConnection,
+    bonds: Bonds,
+) -> anyhow::Result<()> {
     diesel::insert_into(bonds::table)
         .values::<&Vec<BondInsertDb>>(
             &bonds
@@ -88,6 +106,21 @@ pub fn insert_bonds(
 }
 
 pub fn insert_unbonds(
+    transaction_conn: &mut PgConnection,
+    unbonds: Unbonds,
+) -> anyhow::Result<()> {
+    let unbonds_col_count = unbonds::all_columns.len() as i64;
+
+    for chunk in
+        unbonds.chunks((MAX_PARAM_SIZE as i64 / unbonds_col_count) as usize)
+    {
+        insert_unbonds_chunk(transaction_conn, chunk.to_vec())?
+    }
+
+    anyhow::Ok(())
+}
+
+fn insert_unbonds_chunk(
     transaction_conn: &mut PgConnection,
     unbonds: Unbonds,
 ) -> anyhow::Result<()> {

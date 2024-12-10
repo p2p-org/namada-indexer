@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::convert::identity;
 use std::sync::Arc;
 
@@ -15,10 +16,10 @@ use chain::services::{
 };
 use chrono::{NaiveDateTime, Utc};
 use clap::Parser;
-use clap_verbosity_flag::LevelFilter;
 use deadpool_diesel::postgres::Object;
 use namada_sdk::time::DateTimeUtc;
 use orm::migrations::run_migrations;
+use repository::pgf as namada_pgf_repository;
 use shared::block::Block;
 use shared::block_result::BlockResult;
 use shared::checksums::Checksums;
@@ -29,8 +30,8 @@ use shared::id::Id;
 use shared::token::Token;
 use shared::validator::ValidatorSet;
 use tendermint_rpc::HttpClient;
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
+use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tokio_retry::Retry;
 
 #[tokio::main]
 async fn main() -> Result<(), MainError> {
@@ -48,19 +49,7 @@ async fn main() -> Result<(), MainError> {
         checksums.add(code_path, code.to_lowercase());
     }
 
-    let log_level = match config.verbosity.log_level_filter() {
-        LevelFilter::Off => None,
-        LevelFilter::Error => Some(Level::ERROR),
-        LevelFilter::Warn => Some(Level::WARN),
-        LevelFilter::Info => Some(Level::INFO),
-        LevelFilter::Debug => Some(Level::DEBUG),
-        LevelFilter::Trace => Some(Level::TRACE),
-    };
-    if let Some(log_level) = log_level {
-        let subscriber =
-            FmtSubscriber::builder().with_max_level(log_level).finish();
-        tracing::subscriber::set_global_default(subscriber).unwrap();
-    }
+    config.log.init();
 
     let client = Arc::new(client);
 
@@ -73,11 +62,84 @@ async fn main() -> Result<(), MainError> {
         .context_db_interact_error()
         .into_db_error()?;
 
-    initial_query(&client, &conn).await?;
-
-    let crawler_state = db_service::get_chain_crawler_state(&conn)
+    // See if we can start from existing crawler_state
+    let crawler_state = match db_service::try_get_chain_crawler_state(&conn)
         .await
-        .into_db_error()?;
+        .into_db_error()?
+    {
+        Some(crawler_state) => {
+            tracing::info!(
+                    "Found chain crawler state, attempting initial crawl at block {}...",
+                    crawler_state.last_processed_block
+                );
+
+            // Try to run crawler_fn with the last processed block
+            let crawl_result = crawling_fn(
+                crawler_state.last_processed_block,
+                client.clone(),
+                conn.clone(),
+                checksums.clone(),
+            )
+            .await;
+
+            match crawl_result {
+                Err(MainError::RpcError) => {
+                    // If there was an RpcError, it likely means the block was pruned from the node.
+                    // We need to do an initial_query in that case.
+                    tracing::error!(
+                        "Failed to query block {}, starting from initial_query ...",
+                        crawler_state.last_processed_block,
+                    );
+                    None
+                }
+                Err(_) => {
+                    // If any other type of error occurred, we should not increment
+                    // last_processed_block but crawl from there without initial_query
+                    tracing::info!(
+                        "Initial crawl had an error (not RpcError), continuing from block {}...",
+                        crawler_state.last_processed_block
+                    );
+                    Some(crawler_state)
+                }
+                Ok(_) => {
+                    // If the crawl was successful, increment last_processed block and continue from there.
+                    let next_block = crawler_state.last_processed_block + 1;
+                    tracing::info!(
+                        "Initial crawl was successful, continuing from block {}...",
+                        next_block
+                    );
+                    Some(ChainCrawlerState {
+                        last_processed_block: next_block,
+                        ..crawler_state
+                    })
+                }
+            }
+        }
+        None => {
+            tracing::info!(
+                "No chain crawler state found, starting from initial_query..."
+            );
+            None
+        }
+    };
+
+    // Handle cases where we need to perform initial query
+    let crawler_state = match crawler_state {
+        Some(state) => state,
+        None => {
+            initial_query(
+                &client,
+                &conn,
+                config.initial_query_retry_time,
+                config.initial_query_retry_attempts,
+            )
+            .await?;
+
+            db_service::get_chain_crawler_state(&conn)
+                .await
+                .into_db_error()?
+        }
+    };
 
     crawl(
         move |block_height| {
@@ -106,22 +168,26 @@ async fn crawling_fn(
         let timestamp = Utc::now().naive_utc();
         update_crawler_timestamp(&conn, timestamp).await?;
 
-        tracing::warn!("Block {} was not processed, retry...", block_height);
+        tracing::trace!(
+            block = block_height,
+            "Block does not exist yet, waiting...",
+        );
 
         return Err(MainError::NoAction);
     }
 
-    tracing::info!("Query block...");
+    tracing::debug!(block = block_height, "Query block...");
     let tm_block_response =
         tendermint_service::query_raw_block_at_height(&client, block_height)
             .await
             .into_rpc_error()?;
-    tracing::info!(
+    tracing::debug!(
+        block = block_height,
         "Raw block contains {} txs...",
         tm_block_response.block.data.len()
     );
 
-    tracing::info!("Query block results...");
+    tracing::debug!(block = block_height, "Query block results...");
     let tm_block_results_response =
         tendermint_service::query_raw_block_results_at_height(
             &client,
@@ -131,13 +197,13 @@ async fn crawling_fn(
         .into_rpc_error()?;
     let block_results = BlockResult::from(tm_block_results_response);
 
-    tracing::info!("Query epoch...");
+    tracing::debug!(block = block_height, "Query epoch...");
     let epoch =
         namada_service::get_epoch_at_block_height(&client, block_height)
             .await
             .into_rpc_error()?;
 
-    tracing::info!("Query first block in epoch...");
+    tracing::debug!(block = block_height, "Query first block in epoch...");
     let first_block_in_epoch =
         namada_service::get_first_block_in_epoch(&client)
             .await
@@ -150,18 +216,52 @@ async fn crawling_fn(
         epoch,
         block_height,
     );
-    tracing::info!("Deserialized {} txs...", block.transactions.len());
+    tracing::debug!(
+        block = block_height,
+        txs = block.transactions.len(),
+        "Deserialized {} txs...",
+        block.transactions.len()
+    );
 
     let native_token = namada_service::get_native_token(&client)
         .await
         .into_rpc_error()?;
 
-    let ibc_tokens = block.ibc_tokens().into_iter().map(Token::Ibc).collect();
+    let ibc_tokens = block
+        .ibc_tokens()
+        .into_iter()
+        .map(Token::Ibc)
+        .collect::<Vec<Token>>();
 
-    let addresses = block.addresses_with_balance_change(native_token);
-    let balances = namada_service::query_balance(&client, &addresses)
+    let addresses = block.addresses_with_balance_change(&native_token);
+
+    let pgf_receipient_addresses = if first_block_in_epoch.eq(&block_height) {
+        conn.interact(move |conn| {
+            namada_pgf_repository::get_pgf_receipients_balance_changes(
+                conn,
+                &native_token,
+            )
+        })
         .await
-        .into_rpc_error()?;
+        .context_db_interact_error()
+        .and_then(identity)
+        .into_db_error()?
+    } else {
+        HashSet::default()
+    };
+
+    let all_balance_changed_addresses = pgf_receipient_addresses
+        .union(&addresses)
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    let balances = namada_service::query_balance(
+        &client,
+        &all_balance_changed_addresses,
+        block_height,
+    )
+    .await
+    .into_rpc_error()?;
     tracing::info!("Updating balance for {} addresses...", addresses.len());
 
     let next_governance_proposal_id =
@@ -170,7 +270,11 @@ async fn crawling_fn(
             .into_rpc_error()?;
 
     let proposals = block.governance_proposal(next_governance_proposal_id);
-    tracing::info!("Creating {} governance proposals...", proposals.len());
+    tracing::debug!(
+        block = block_height,
+        "Creating {} governance proposals...",
+        proposals.len()
+    );
 
     let proposals_with_tally =
         namada_service::query_tallies(&client, proposals)
@@ -178,7 +282,11 @@ async fn crawling_fn(
             .into_rpc_error()?;
 
     let proposals_votes = block.governance_votes();
-    tracing::info!("Creating {} governance votes...", proposals_votes.len());
+    tracing::debug!(
+        block = block_height,
+        "Creating {} governance votes...",
+        proposals_votes.len()
+    );
 
     let validators = block.validators();
     let validator_set = ValidatorSet {
@@ -188,7 +296,11 @@ async fn crawling_fn(
 
     let addresses = block.bond_addresses();
     let bonds = query_bonds(&client, addresses).await.into_rpc_error()?;
-    tracing::info!("Updating bonds for {} addresses", bonds.len());
+    tracing::debug!(
+        block = block_height,
+        "Updating bonds for {} addresses",
+        bonds.len()
+    );
 
     let bonds_updates = bonds
         .iter()
@@ -206,12 +318,17 @@ async fn crawling_fn(
     let unbonds = namada_service::query_unbonds(&client, addresses)
         .await
         .into_rpc_error()?;
-    tracing::info!("Updating unbonds for {} addresses", unbonds.len());
+    tracing::debug!(
+        block = block_height,
+        "Updating unbonds for {} addresses",
+        unbonds.len()
+    );
 
     let withdraw_addreses = block.withdraw_addresses();
 
     let revealed_pks = block.revealed_pks();
-    tracing::info!(
+    tracing::debug!(
+        block = block_height,
         "Updating revealed pks for {} addresses",
         revealed_pks.len()
     );
@@ -229,6 +346,24 @@ async fn crawling_fn(
         timestamp: timestamp_in_sec,
     };
 
+    tracing::info!(
+        txs = block.transactions.len(),
+        ibc_tokens = ibc_tokens.len(),
+        balance_changes = balances.len(),
+        proposals = proposals_with_tally.len(),
+        votes = proposals_votes.len(),
+        validators = validators.len(),
+        bonds = bonds_updates.len(),
+        unbonds = unbonds.len(),
+        withdraws = withdraw_addreses.len(),
+        claimed_rewards = reward_claimers.len(),
+        revealed_pks = revealed_pks.len(),
+        epoch = epoch,
+        first_block_in_epoch = first_block_in_epoch,
+        block = block_height,
+        "Queried block successfully",
+    );
+
     conn.interact(move |conn| {
         conn.build_transaction()
             .read_write()
@@ -238,7 +373,7 @@ async fn crawling_fn(
                     ibc_tokens,
                 )?;
 
-                repository::balance::insert_balance(
+                repository::balance::insert_balances(
                     transaction_conn,
                     balances,
                 )?;
@@ -298,14 +433,30 @@ async fn crawling_fn(
     .context_db_interact_error()
     .into_db_error()?
     .context("Commit block db transaction error")
-    .into_db_error()
+    .into_db_error()?;
+
+    tracing::info!(block = block_height, "Inserted block into database",);
+
+    Ok(())
 }
 
 async fn initial_query(
     client: &HttpClient,
     conn: &Object,
+    retry_time: u64,
+    retry_attempts: usize,
 ) -> Result<(), MainError> {
-    tracing::info!("Querying initial data...");
+    let retry_strategy = ExponentialBackoff::from_millis(retry_time)
+        .map(jitter)
+        .take(retry_attempts);
+    Retry::spawn(retry_strategy, || try_initial_query(client, conn)).await
+}
+
+async fn try_initial_query(
+    client: &HttpClient,
+    conn: &Object,
+) -> Result<(), MainError> {
+    tracing::debug!("Querying initial data...");
     let block_height =
         query_last_block_height(client).await.into_rpc_error()?;
     let epoch = namada_service::get_epoch_at_block_height(client, block_height)
@@ -317,9 +468,15 @@ async fn initial_query(
 
     let tokens = query_tokens(client).await.into_rpc_error()?;
 
-    let balances = query_all_balances(client).await.into_rpc_error()?;
+    // This can sometimes fail if the last block height in the node has moved
+    // forward after we queried for it. In that case, query_all_balances
+    // returns an Err indicating that it can only be used for
+    // the last block. This function will be retried in that case.
+    let balances = query_all_balances(client, block_height)
+        .await
+        .into_rpc_error()?;
 
-    tracing::info!("Querying validators set...");
+    tracing::debug!(block = block_height, "Querying validators set...");
     let pipeline_length = namada_service::query_pipeline_length(client)
         .await
         .into_rpc_error()?;
@@ -332,12 +489,12 @@ async fn initial_query(
     .await
     .into_rpc_error()?;
 
-    tracing::info!("Querying bonds and unbonds...");
+    tracing::debug!(block = block_height, "Querying bonds and unbonds...",);
     let (bonds, unbonds) = query_all_bonds_and_unbonds(client, None, None)
         .await
         .into_rpc_error()?;
 
-    tracing::info!("Querying proposals...");
+    tracing::debug!(block = block_height, "Querying proposals...");
     let proposals = query_all_proposals(client).await.into_rpc_error()?;
     let proposals_with_tally =
         namada_service::query_tallies(client, proposals.clone())
@@ -360,7 +517,7 @@ async fn initial_query(
         timestamp,
     };
 
-    tracing::info!("Inserting initial data... ");
+    tracing::info!(block = block_height, "Inserting initial data...");
 
     conn.interact(move |conn| {
         conn.build_transaction()
@@ -368,7 +525,12 @@ async fn initial_query(
             .run(|transaction_conn| {
                 repository::balance::insert_tokens(transaction_conn, tokens)?;
 
-                repository::balance::insert_balance_in_chunks(
+                tracing::debug!(
+                    block = block_height,
+                    "Inserting {} balances...",
+                    balances.len()
+                );
+                repository::balance::insert_balances(
                     transaction_conn,
                     balances,
                 )?;
@@ -409,8 +571,6 @@ async fn can_process(
     block_height: u32,
     client: Arc<HttpClient>,
 ) -> Result<bool, MainError> {
-    tracing::info!("Attempting to process block: {}...", block_height);
-
     let last_block_height = namada_service::query_last_block_height(&client)
         .await
         .map_err(|e| {

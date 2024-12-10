@@ -38,6 +38,22 @@ pub mod sql_types {
         std::fmt::Debug,
         diesel::sql_types::SqlType,
     )]
+    #[diesel(postgres_type(name = "payment_kind"))]
+    pub struct PaymentKind;
+
+    #[derive(
+        diesel::query_builder::QueryId,
+        std::fmt::Debug,
+        diesel::sql_types::SqlType,
+    )]
+    #[diesel(postgres_type(name = "payment_recurrence"))]
+    pub struct PaymentRecurrence;
+
+    #[derive(
+        diesel::query_builder::QueryId,
+        std::fmt::Debug,
+        diesel::sql_types::SqlType,
+    )]
     #[diesel(postgres_type(name = "token_type"))]
     pub struct TokenType;
 
@@ -75,8 +91,9 @@ pub mod sql_types {
 }
 
 diesel::table! {
-    balances (id) {
+    balance_changes (id) {
         id -> Int4,
+        height -> Int4,
         owner -> Varchar,
         #[max_length = 64]
         token -> Varchar,
@@ -214,6 +231,21 @@ diesel::table! {
 }
 
 diesel::table! {
+    use diesel::sql_types::*;
+    use super::sql_types::PaymentRecurrence;
+    use super::sql_types::PaymentKind;
+
+    public_good_funding (id) {
+        id -> Int4,
+        proposal_id -> Int4,
+        payment_recurrence -> PaymentRecurrence,
+        payment_kind -> PaymentKind,
+        receipient -> Varchar,
+        amount -> Numeric,
+    }
+}
+
+diesel::table! {
     revealed_pk (id) {
         id -> Int4,
         address -> Varchar,
@@ -278,16 +310,17 @@ diesel::table! {
     }
 }
 
-diesel::joinable!(balances -> token (token));
+diesel::joinable!(balance_changes -> token (token));
 diesel::joinable!(bonds -> validators (validator_id));
 diesel::joinable!(governance_votes -> governance_proposals (proposal_id));
 diesel::joinable!(ibc_token -> token (address));
 diesel::joinable!(inner_transactions -> wrapper_transactions (wrapper_id));
 diesel::joinable!(pos_rewards -> validators (validator_id));
+diesel::joinable!(public_good_funding -> governance_proposals (proposal_id));
 diesel::joinable!(unbonds -> validators (validator_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
-    balances,
+    balance_changes,
     bonds,
     chain_parameters,
     crawler_state,
@@ -298,6 +331,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     ibc_token,
     inner_transactions,
     pos_rewards,
+    public_good_funding,
     revealed_pk,
     token,
     unbonds,
