@@ -3,9 +3,13 @@ name: Check Stuff 👨‍🔧
 on:
   merge_group:
   pull_request:
+    branches:
+      - main
+      - '*-maint'
   push:
     branches:
       - main
+      - '*-maint'
 
 concurrency:
   group: ${{ github.ref }}
@@ -30,8 +34,12 @@ jobs:
         with:
           version: "25.0"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - id: rust_toolchain
+        run: echo "version=$(cat $GITHUB_WORKSPACE/rust-stable-version | tr -d '\n')" >> $GITHUB_OUTPUT
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: ${{ steps.rust_toolchain.outputs.version }}
+          components: clippy
           cache: true
       - run: just clippy
 
@@ -63,8 +71,11 @@ jobs:
         with:
           version: "25.0"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - id: rust_toolchain
+        run: echo "version=$(cat $GITHUB_WORKSPACE/rust-stable-version | tr -d '\n')" >> $GITHUB_OUTPUT
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          toolchain: ${{ steps.rust_toolchain.outputs.version }}
           cache: true
       - run: just test
         env:
@@ -93,34 +104,19 @@ jobs:
         with:
           version: "25.0"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - id: rust_toolchain
+        run: echo "version=$(cat $GITHUB_WORKSPACE/rust-nightly-version | tr -d '\n')" >> $GITHUB_OUTPUT
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: nightly
+          toolchain: ${{ steps.rust_toolchain.outputs.version }}
           components: rustfmt
           cache: true
-      - run: just fmt
-
-  build:
-    if: ${{ github.event_name == 'pull_request' }}
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/install-action@just
-      - uses: rui314/setup-mold@v1
-      - uses: heliaxdev/setup-protoc@v2
-        with:
-          version: "25.0"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: true
-      - run: just build
+      - run: just fmt-check
 
   docker:
     name: Docker
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'merge_group' || github.ref == 'refs/heads/main' }}
+    # if: ${{ github.event_name == 'merge_group' || github.event_name == 'pull_request' }}
     env:
       GIT_LFS_SKIP_SMUDGE: 1
       REGISTRY_URL: ghcr.io
@@ -145,6 +141,18 @@ jobs:
         uses: actions/checkout@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_URL }}/anoma/namada-indexer
+          flavor: |
+            latest=auto
+            prefix=${{ matrix.docker.image }}
+            suffix=
+          tags: |
+            type=ref,event=branch,prefix=${{ matrix.docker.image }}-branch-
+            type=ref,event=pr,prefix=${{ matrix.docker.image }}-pr-
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -157,15 +165,15 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          build-args: PACKAGE=${{matrix.docker.package}}
-          push: ${{ github.ref == 'refs/heads/main' }}
-          tags: ${{ env.REGISTRY_URL }}/anoma/namada-indexer:${{ matrix.docker.image }}-main
+          build-args: PACKAGE=${{ matrix.docker.package }}
+          push: ${{ github.event.pull_request.head.repo.full_name == 'anoma/namada-indexer' || github.event_name == 'push'  }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   can_enqueue:
-    needs: [clippy, format, build, validate-swagger]
+    needs: [clippy, format, docker, validate-swagger]
     if: always() && github.event_name != 'merge_group'
     permissions:
       actions: read
@@ -196,4 +204,3 @@ jobs:
           echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >> $GITHUB_ENV
       - name: check outcomes
         run: "[ $ALL_SUCCESS == true ]"
-
