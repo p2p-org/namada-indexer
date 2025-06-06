@@ -1,0 +1,3 @@
+[submodule "namada-indexer"]
+	path = namada-indexer
+	url = git@github.com:anoma/namada-indexer.git
